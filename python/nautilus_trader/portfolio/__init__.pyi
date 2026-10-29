@@ -23,6 +23,8 @@ class PortfolioConfig:
     @property
     def convert_to_account_base_currency(self) -> bool: ...
     @property
+    def recalculate_margin_equity(self) -> bool: ...
+    @property
     def equity_curve(self) -> bool: ...
     @property
     def min_account_state_logging_interval_ms(self) -> int | None: ...
@@ -40,6 +42,7 @@ class PortfolioConfig:
         min_account_state_logging_interval_ms: int | None = None,
         debug: bool | None = None,
         snapshot_interval_ms: int | None = None,
+        recalculate_margin_equity: bool | None = None,
     ) -> PortfolioConfig: ...
 
 @typing.final

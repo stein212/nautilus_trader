@@ -156,6 +156,14 @@ Premium-based instruments, including options and binary options, exchange notion
 Their signed marks represent assets or liabilities. Futures and perpetuals exchange no notional cash
 and use the unrealized PnL pipeline.
 
+`PortfolioConfig(recalculate_margin_equity=True)` makes `equity()` recalculate unrealized PnL for open
+non-premium margin positions instead of reusing cached instrument PnL.
+Use this for trade-only backtests where equity is read before `unrealized_pnl()`: trade ticks update cached
+prices but do not invalidate the portfolio's PnL cache.
+The option defaults to `False` and adds no trade handler or per-trade work.
+Account-filtered equity already recalculates PnL; premium-based valuation, price priority, currency conversion,
+and missing-price reporting are unchanged.
+
 :::note
 Venue totals may represent cash or include position value. Portfolio uses them without normalization,
 so reported-account equity may differ from venue equity.

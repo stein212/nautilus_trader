@@ -810,6 +810,8 @@ impl Portfolio {
     /// positions and unrealized PnL of other open positions, per currency.
     /// For reported margin accounts: balance total plus unrealized PnL of all open positions.
     /// Calculated accounts have `calculate_account_state` enabled and update balances from fills.
+    /// With `recalculate_margin_equity` enabled, non-premium positions bypass cached unrealized
+    /// PnL and use the current portfolio price and currency conversion paths on each equity read.
     ///
     /// Open-position instruments that cannot be priced are tracked via
     /// [`Portfolio::missing_price_instruments`] (and warned once) for all account types,
@@ -1367,9 +1369,8 @@ impl Portfolio {
             );
 
         for (instrument_id, pnl_account_id) in instruments {
-            // The instrument-keyed PnL cache spans accounts, so filtered queries recalculate
-            let cached = pnl_account_id
-                .is_none()
+            // Filtered queries and opt-in fresh equity bypass the instrument-keyed PnL cache
+            let cached = (!self.config.recalculate_margin_equity && pnl_account_id.is_none())
                 .then(|| {
                     self.inner
                         .borrow()

@@ -27,10 +27,10 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, UUID4, UnixNanos, approx_eq, datetime::NANOSECONDS_IN_DAY};
 use nautilus_model::{
     accounts::{Account, AccountAny},
-    data::{Bar, BarType, MarkPriceUpdate, QuoteTick},
+    data::{Bar, BarType, MarkPriceUpdate, QuoteTick, TradeTick},
     enums::{
-        AccountType, LiquiditySide, OmsType, OrderSide, OrderType, PositionAdjustmentType,
-        PositionSide,
+        AccountType, AggressorSide, LiquiditySide, OmsType, OrderSide, OrderType,
+        PositionAdjustmentType, PositionSide,
     },
     events::{
         AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderPendingCancel,
@@ -56,9 +56,9 @@ use nautilus_model::{
         CryptoFuture, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny,
         stubs::{
             audusd_sim, betting, binary_option, btcusd_bybit, commodity_gold,
-            crypto_futures_spread_btc_deribit, crypto_option_btc_deribit, currency_pair_btcusdt,
-            default_fx_ccy, equity_aapl, ethusd_bybit, futures_contract_es, futures_spread_es,
-            option_contract_appl, option_spread,
+            crypto_futures_spread_btc_deribit, crypto_option_btc_deribit, crypto_perpetual_ethusdt,
+            currency_pair_btcusdt, default_fx_ccy, equity_aapl, ethusd_bybit, futures_contract_es,
+            futures_spread_es, option_contract_appl, option_spread,
         },
     },
     orders::{Order, OrderAny, OrderTestBuilder},
@@ -9166,6 +9166,393 @@ fn test_equity_margin_account_with_unrealized_pnl(
     );
 }
 
+fn cache_margin_trade(portfolio: &Portfolio, instrument: &InstrumentAny, price: &str) {
+    let trade = TradeTick::new(
+        instrument.id(),
+        Price::from(price),
+        Quantity::from("1"),
+        AggressorSide::Buy,
+        TradeId::new(format!("T-{price}")),
+        0.into(),
+        0.into(),
+    );
+    portfolio.cache().borrow_mut().add_trade(trade).unwrap();
+}
+
+#[rstest]
+#[case::default(None)]
+#[case::disabled(Some(false))]
+#[case::enabled(Some(true))]
+fn test_margin_equity_recalculates_trade_only_prices(
+    simple_cache: Cache,
+    clock: VirtualClock,
+    #[case] recalculate: Option<bool>,
+    #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+) {
+    let config = recalculate.map(|enabled| {
+        PortfolioConfig::builder()
+            .recalculate_margin_equity(enabled)
+            .build()
+            .unwrap()
+    });
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        config,
+    );
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::new("BINANCE-001");
+    let venue = instrument.id().venue;
+    portfolio.update_account(&get_margin_account(Some(account_id.as_str())));
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    cache_margin_trade(&portfolio, &instrument, "110.00");
+    let fill = make_fill_for_account(
+        &instrument,
+        account_id,
+        side,
+        Quantity::from("2"),
+        Price::from("100.00"),
+        PositionId::new("P-TRADE-EQUITY"),
+    );
+    let position = Position::new(&instrument, fill);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+
+    let direction = if side == OrderSide::Buy {
+        dec!(1)
+    } else {
+        dec!(-1)
+    };
+    let balance = dec!(100000);
+    let mut cached_pnl = dec!(20) * direction;
+    assert_eq!(
+        portfolio.unrealized_pnl(&instrument.id()),
+        Some(Money::from_decimal(cached_pnl, Currency::USDT()).unwrap())
+    );
+
+    for (price, long_pnl) in [
+        ("120.00", dec!(40)),
+        ("130.00", dec!(60)),
+        ("95.00", dec!(-10)),
+    ] {
+        // No portfolio data handler or PnL query runs between the trade and equity
+        cache_margin_trade(&portfolio, &instrument, price);
+        let current_pnl = long_pnl * direction;
+        let expected_pnl = if recalculate == Some(true) {
+            current_pnl
+        } else {
+            cached_pnl
+        };
+        let expected_equity =
+            Money::from_decimal(balance + expected_pnl, Currency::USDT()).unwrap();
+        let current_equity = Money::from_decimal(balance + current_pnl, Currency::USDT()).unwrap();
+
+        assert_eq!(
+            portfolio.equity(&venue, None)[&Currency::USDT()],
+            expected_equity
+        );
+        assert_eq!(
+            portfolio.equity(&venue, Some(&account_id))[&Currency::USDT()],
+            current_equity
+        );
+        assert_eq!(
+            portfolio.equity(&venue, None)[&Currency::USDT()],
+            expected_equity
+        );
+        assert_eq!(
+            portfolio.unrealized_pnl(&instrument.id()),
+            Some(Money::from_decimal(current_pnl, Currency::USDT()).unwrap())
+        );
+        assert_eq!(
+            portfolio.equity(&venue, None)[&Currency::USDT()],
+            current_equity
+        );
+        cached_pnl = current_pnl;
+    }
+}
+
+#[rstest]
+fn test_margin_equity_recalculation_isolates_accounts(
+    simple_cache: Cache,
+    clock: VirtualClock,
+    #[values(false, true)] recalculate: bool,
+) {
+    let config = PortfolioConfig::builder()
+        .recalculate_margin_equity(recalculate)
+        .build()
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        Some(config),
+    );
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let venue = instrument.id().venue;
+    let account_a = AccountId::new("BINANCE-001");
+    let account_b = AccountId::new("OTHER-002");
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    cache_margin_trade(&portfolio, &instrument, "105.00");
+
+    for (account_id, balance, side, quantity, entry) in [
+        (account_a, "1000 USDT", OrderSide::Buy, "2", "100.00"),
+        (account_b, "2000 USDT", OrderSide::Sell, "3", "110.00"),
+    ] {
+        let mut state = get_margin_account(Some(account_id.as_str()));
+        state.balances = vec![AccountBalance::new(
+            Money::from(balance),
+            Money::zero(Currency::USDT()),
+            Money::from(balance),
+        )];
+        portfolio.update_account(&state);
+        let position = Position::new(
+            &instrument,
+            make_fill_for_account(
+                &instrument,
+                account_id,
+                side,
+                Quantity::from(quantity),
+                Price::from(entry),
+                PositionId::new(format!("P-{account_id}")),
+            ),
+        );
+        portfolio
+            .cache()
+            .borrow_mut()
+            .add_position(&position, OmsType::Hedging)
+            .unwrap();
+        portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+    }
+    assert_eq!(
+        portfolio.unrealized_pnl(&instrument.id()),
+        Some(Money::from("25 USDT"))
+    );
+
+    for (price, equity_a, equity_b, fresh_unfiltered) in [
+        ("120.00", "1040 USDT", "1970 USDT", "1010 USDT"),
+        ("90.00", "980 USDT", "2060 USDT", "1040 USDT"),
+    ] {
+        cache_margin_trade(&portfolio, &instrument, price);
+
+        // Only BINANCE-001 supplies the venue balance; both accounts supply PnL
+        let expected = if recalculate {
+            fresh_unfiltered
+        } else {
+            "1025 USDT"
+        };
+        assert_eq!(
+            portfolio.equity(&venue, None)[&Currency::USDT()],
+            Money::from(expected)
+        );
+
+        for (account_id, expected_equity) in [
+            (account_b, equity_b),
+            (account_a, equity_a),
+            (account_b, equity_b),
+        ] {
+            assert_eq!(
+                portfolio.equity(&venue, Some(&account_id))[&Currency::USDT()],
+                Money::from(expected_equity)
+            );
+        }
+        assert_eq!(
+            portfolio.equity(&venue, None)[&Currency::USDT()],
+            Money::from(expected)
+        );
+    }
+}
+
+#[rstest]
+#[case::long_mark(OrderSide::Buy, true, "100060 USDT")]
+#[case::short_mark(OrderSide::Sell, true, "99940 USDT")]
+#[case::long_bid(OrderSide::Buy, false, "100020 USDT")]
+#[case::short_ask(OrderSide::Sell, false, "99956 USDT")]
+fn test_margin_equity_recalculation_preserves_price_priority(
+    simple_cache: Cache,
+    clock: VirtualClock,
+    #[case] side: OrderSide,
+    #[case] use_mark_prices: bool,
+    #[case] expected: &str,
+) {
+    let config = PortfolioConfig::builder()
+        .recalculate_margin_equity(true)
+        .use_mark_prices(use_mark_prices)
+        .build()
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        Some(config),
+    );
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::new("BINANCE-001");
+    portfolio.update_account(&get_margin_account(Some(account_id.as_str())));
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    cache_margin_trade(&portfolio, &instrument, "100.00");
+    let position = Position::new(
+        &instrument,
+        make_fill_for_account(
+            &instrument,
+            account_id,
+            side,
+            Quantity::from("2"),
+            Price::from("100.00"),
+            PositionId::new("P-EQUITY-PRIORITY"),
+        ),
+    );
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+    portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+    assert_eq!(
+        portfolio.unrealized_pnl(&instrument.id()),
+        Some(Money::from("0 USDT"))
+    );
+
+    cache_margin_trade(&portfolio, &instrument, "150.00");
+    let quote = get_quote_tick(&instrument, 110.0, 122.0, 1.0, 1.0);
+    portfolio.cache().borrow_mut().add_quote(quote).unwrap();
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_mark_price(MarkPriceUpdate::new(
+            instrument.id(),
+            Price::from("130.00"),
+            0.into(),
+            0.into(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        portfolio.equity(&instrument.id().venue, None)[&Currency::USDT()],
+        Money::from(expected)
+    );
+    assert_eq!(
+        portfolio.equity(&instrument.id().venue, Some(&account_id))[&Currency::USDT()],
+        Money::from(expected)
+    );
+}
+
+#[rstest]
+fn test_margin_equity_recalculation_preserves_missing_bar_and_conversion(
+    simple_cache: Cache,
+    clock: VirtualClock,
+    #[values(false, true)] recalculate: bool,
+) {
+    let config = PortfolioConfig::builder()
+        .recalculate_margin_equity(recalculate)
+        .use_mark_xrates(true)
+        .build()
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        Some(config),
+    );
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let venue = instrument.id().venue;
+    let account_id = AccountId::new("BINANCE-001");
+    let mut state = get_margin_account(Some(account_id.as_str()));
+    state.base_currency = Some(Currency::EUR());
+    state.balances = vec![AccountBalance::new(
+        Money::from("1000 EUR"),
+        Money::zero(Currency::EUR()),
+        Money::from("1000 EUR"),
+    )];
+    portfolio.update_account(&state);
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    portfolio
+        .cache()
+        .borrow_mut()
+        .set_mark_xrate(Currency::USDT(), Currency::EUR(), 0.5);
+    let position = Position::new(
+        &instrument,
+        make_fill_for_account(
+            &instrument,
+            account_id,
+            OrderSide::Buy,
+            Quantity::from("2"),
+            Price::from("100.00"),
+            PositionId::new("P-EQUITY-BAR-FX"),
+        ),
+    );
+    portfolio
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Hedging)
+        .unwrap();
+
+    assert_eq!(
+        portfolio.equity(&venue, None),
+        IndexMap::from([(Currency::EUR(), Money::from("1000 EUR"))])
+    );
+    assert_eq!(
+        portfolio.missing_price_instruments(&venue, None),
+        vec![instrument.id()]
+    );
+    assert_eq!(
+        portfolio.equity(&venue, Some(&account_id))[&Currency::EUR()],
+        Money::from("1000 EUR")
+    );
+    assert_eq!(
+        portfolio.missing_price_instruments(&venue, Some(&account_id)),
+        vec![instrument.id()]
+    );
+
+    let bar = get_bar(&instrument, 110.0, 110.0, 110.0, 110.0, 1.0);
+    portfolio.update_bar(&bar);
+    assert_eq!(
+        portfolio.equity(&venue, None),
+        IndexMap::from([(Currency::EUR(), Money::from("1010 EUR"))])
+    );
+    assert_eq!(
+        portfolio.equity(&venue, Some(&account_id))[&Currency::EUR()],
+        Money::from("1010 EUR")
+    );
+    assert!(portfolio.missing_price_instruments(&venue, None).is_empty());
+    assert_eq!(
+        portfolio.unrealized_pnl(&instrument.id()),
+        Some(Money::from("10 EUR"))
+    );
+
+    cache_margin_trade(&portfolio, &instrument, "120.00");
+    let expected = if recalculate { "1020 EUR" } else { "1010 EUR" };
+    assert_eq!(
+        portfolio.equity(&venue, None),
+        IndexMap::from([(Currency::EUR(), Money::from(expected))])
+    );
+    assert_eq!(
+        portfolio.equity(&venue, Some(&account_id))[&Currency::EUR()],
+        Money::from("1020 EUR")
+    );
+    assert!(
+        portfolio
+            .missing_price_instruments(&venue, Some(&account_id))
+            .is_empty()
+    );
+}
+
 #[rstest]
 fn test_equity_margin_account_marks_inverse_zero_price_unpriced(mut portfolio: Portfolio) {
     let instrument = InstrumentAny::CryptoPerpetual(btcusd_bybit());
@@ -11290,18 +11677,28 @@ fn test_unrealized_pnl_skips_empty_zero_quote_side(mut portfolio: Portfolio) {
 }
 
 #[rstest]
-#[case(OrderSide::Buy, "5.00", "9500 USD", "0 USD", "10000 USD")]
-#[case(OrderSide::Sell, "5.00", "10500 USD", "0 USD", "10000 USD")]
-#[case(OrderSide::Buy, "6.00", "9500 USD", "100 USD", "10100 USD")]
-#[case(OrderSide::Sell, "6.00", "10500 USD", "-100 USD", "9900 USD")]
+#[case(OrderSide::Buy, "5.00", ("9500 USD", "0 USD", "10000 USD"))]
+#[case(OrderSide::Sell, "5.00", ("10500 USD", "0 USD", "10000 USD"))]
+#[case(OrderSide::Buy, "6.00", ("9500 USD", "100 USD", "10100 USD"))]
+#[case(OrderSide::Sell, "6.00", ("10500 USD", "-100 USD", "9900 USD"))]
 fn test_margin_option_equity(
-    mut portfolio: Portfolio,
+    simple_cache: Cache,
+    clock: VirtualClock,
+    #[values(false, true)] recalculate: bool,
     #[case] side: OrderSide,
     #[case] mark: &str,
-    #[case] cash: &str,
-    #[case] pnl: &str,
-    #[case] equity: &str,
+    #[case] expected: (&str, &str, &str),
 ) {
+    let (cash, pnl, equity) = expected;
+    let config = PortfolioConfig::builder()
+        .recalculate_margin_equity(recalculate)
+        .build()
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        Some(config),
+    );
     let instrument = InstrumentAny::OptionContract(option_contract_appl());
     let account_id = AccountId::new("OPRA-001");
     let mut state = get_margin_account(Some(account_id.as_str()));
@@ -11451,12 +11848,23 @@ fn test_margin_option_snapshot_combines_cash_before_money_conversion(
 #[case(OrderSide::Buy, "6.00", "100 USD", "10100 USD")]
 #[case(OrderSide::Sell, "6.00", "-100 USD", "9900 USD")]
 fn test_margin_reported_option_equity_preserves_pnl_valuation(
-    mut portfolio: Portfolio,
+    simple_cache: Cache,
+    clock: VirtualClock,
+    #[values(false, true)] recalculate: bool,
     #[case] side: OrderSide,
     #[case] mark: &str,
     #[case] pnl: &str,
     #[case] equity: &str,
 ) {
+    let config = PortfolioConfig::builder()
+        .recalculate_margin_equity(recalculate)
+        .build()
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        Some(config),
+    );
     let instrument = InstrumentAny::OptionContract(option_contract_appl());
     let account_id = AccountId::new("OPRA-001");
     let mut state = get_margin_account(Some(account_id.as_str()));

@@ -43,7 +43,7 @@ use crate::{
 impl PortfolioConfig {
     /// Configuration for `Portfolio` instances.
     #[new]
-    #[pyo3(signature = (use_mark_prices=None, use_mark_xrates=None, bar_updates=None, convert_to_account_base_currency=None, equity_curve=None, min_account_state_logging_interval_ms=None, debug=None, snapshot_interval_ms=None))]
+    #[pyo3(signature = (use_mark_prices=None, use_mark_xrates=None, bar_updates=None, convert_to_account_base_currency=None, equity_curve=None, min_account_state_logging_interval_ms=None, debug=None, snapshot_interval_ms=None, recalculate_margin_equity=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         use_mark_prices: Option<bool>,
@@ -54,6 +54,7 @@ impl PortfolioConfig {
         min_account_state_logging_interval_ms: Option<u64>,
         debug: Option<bool>,
         snapshot_interval_ms: Option<u64>,
+        recalculate_margin_equity: Option<bool>,
     ) -> PyResult<Self> {
         let default = Self::default();
         let config = Self {
@@ -62,6 +63,8 @@ impl PortfolioConfig {
             bar_updates: bar_updates.unwrap_or(default.bar_updates),
             convert_to_account_base_currency: convert_to_account_base_currency
                 .unwrap_or(default.convert_to_account_base_currency),
+            recalculate_margin_equity: recalculate_margin_equity
+                .unwrap_or(default.recalculate_margin_equity),
             equity_curve: equity_curve.unwrap_or(default.equity_curve),
             min_account_state_logging_interval_ms,
             snapshot_interval_ms,
@@ -97,6 +100,11 @@ impl PortfolioConfig {
     #[getter]
     fn convert_to_account_base_currency(&self) -> bool {
         self.convert_to_account_base_currency
+    }
+
+    #[getter]
+    fn recalculate_margin_equity(&self) -> bool {
+        self.recalculate_margin_equity
     }
 
     #[getter]

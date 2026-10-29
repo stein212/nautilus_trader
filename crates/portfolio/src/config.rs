@@ -63,6 +63,13 @@ pub struct PortfolioConfig {
     #[serde(default = "default_true")]
     #[builder(default = true)]
     pub convert_to_account_base_currency: bool,
+    /// If margin equity should recalculate unrealized PnL for open non-premium positions.
+    /// If false (default), unfiltered equity queries may reuse the instrument PnL cache.
+    /// If true, uses the current portfolio price and currency conversion paths on each read.
+    /// Premium-based position valuation is unchanged.
+    #[serde(default)]
+    #[builder(default)]
+    pub recalculate_margin_equity: bool,
     /// If mark-to-market equity snapshots should be recorded and published for every account.
     ///
     /// Enabled by default. Records at account registration, every UTC midnight including
